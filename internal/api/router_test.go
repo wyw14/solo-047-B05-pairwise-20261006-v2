@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -26,6 +27,11 @@ import (
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
+	return testServerWithPersister(t, nil)
+}
+
+func testServerWithPersister(t *testing.T, persist repair.PermitPersister) *Server {
+	t.Helper()
 	clock := fixedClock{now: time.Date(2026, 8, 24, 3, 0, 0, 0, time.UTC)}
 	ids := platform.UUIDGenerator{}
 	registry := topology.NewRegistry()
@@ -43,7 +49,13 @@ func testServer(t *testing.T) *Server {
 	drainer := route.NewDrainer(0)
 	activator := route.NewActivator(registry)
 	receipts := landing.NewReceiptRegistry()
-	permitService := repair.NewPermitService(feed.NewIsolationService(), receipts, ids, clock.Now)
+	journal := store.NewJournal(filepath.Join(t.TempDir(), "events.jsonl"))
+	if persist == nil {
+		persist = func(permit repair.Permit) error {
+			return journal.Append("feed-isolation", permit.ID, permit, clock.Now())
+		}
+	}
+	permitService := repair.NewPermitService(feed.NewIsolationService(), receipts, ids, clock.Now, persist)
 	circuit, err := feed.NewCircuit("B", "east", clock.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +72,7 @@ func testServer(t *testing.T) *Server {
 	acceptance := repair.NewAcceptanceService(switchover.NewRestorer(drainer, activator, registry, ids, clock.Now), clock.Now)
 	acceptance.Register("S3", target, path)
 	services := &Services{
-		Clock: clock, IDs: ids, Journal: store.NewJournal(filepath.Join(t.TempDir(), "events.jsonl")),
+		Clock: clock, IDs: ids, Journal: journal,
 		Spans: map[string]*span.Span{"S3": target}, Routes: map[string]*route.Route{"R-S3": path},
 		Repeaters: map[string]*repeater.Repeater{"R07": repeaterAsset}, Topology: registry,
 		OTDR:        otdr.NewSessionService(registry, landing.NewScanner(registry, 0), ids, clock.Now),
@@ -106,5 +118,52 @@ func TestHealthAndScanHTTPFlow(t *testing.T) {
 	server.Handler().ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/system/status", nil))
 	if status.Code != http.StatusOK {
 		t.Fatalf("status code=%d body=%s", status.Code, status.Body.String())
+	}
+}
+
+func TestStartIsolationPersistFailureRollsBack(t *testing.T) {
+	attempts := 0
+	server := testServerWithPersister(t, func(repair.Permit) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("journal append: disk full")
+		}
+		return nil
+	})
+	body, _ := json.Marshal(IsolationRequest{CircuitID: "B"})
+
+	failed := httptest.NewRecorder()
+	server.Handler().ServeHTTP(failed, httptest.NewRequest(http.MethodPost, "/api/landings/east/feed-isolations", bytes.NewReader(body)))
+	if failed.Code != http.StatusInternalServerError {
+		t.Fatalf("first attempt status=%d body=%s", failed.Code, failed.Body.String())
+	}
+
+	// The failed attempt left no orphaned isolating circuit, so the retry
+	// succeeds instead of conflicting.
+	retried := httptest.NewRecorder()
+	server.Handler().ServeHTTP(retried, httptest.NewRequest(http.MethodPost, "/api/landings/east/feed-isolations", bytes.NewReader(body)))
+	if retried.Code != http.StatusAccepted {
+		t.Fatalf("retry status=%d body=%s", retried.Code, retried.Body.String())
+	}
+	var permit repair.Permit
+	if err := json.Unmarshal(retried.Body.Bytes(), &permit); err != nil {
+		t.Fatal(err)
+	}
+	if permit.State != repair.PermitIsolating {
+		t.Fatalf("permit state=%s body=%s", permit.State, retried.Body.String())
+	}
+
+	// A further retry while the permit is active returns the same permit.
+	again := httptest.NewRecorder()
+	server.Handler().ServeHTTP(again, httptest.NewRequest(http.MethodPost, "/api/landings/east/feed-isolations", bytes.NewReader(body)))
+	if again.Code != http.StatusAccepted {
+		t.Fatalf("second retry status=%d body=%s", again.Code, again.Body.String())
+	}
+	var same repair.Permit
+	if err := json.Unmarshal(again.Body.Bytes(), &same); err != nil {
+		t.Fatal(err)
+	}
+	if same.ID != permit.ID {
+		t.Fatalf("retry returned permit %s, want active permit %s", same.ID, permit.ID)
 	}
 }

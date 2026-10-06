@@ -32,6 +32,21 @@ func (s *IsolationService) Begin(circuit *Circuit, operationID string, at time.T
 	}, nil
 }
 
+// Abort compensates a Begin whose follow-up failed (for example the permit
+// could not be persisted), restoring the circuit to the snapshot captured
+// before Begin. It refuses to touch the circuit when the active operation no
+// longer matches, so a state that has since moved on is never clobbered.
+func (s *IsolationService) Abort(circuit *Circuit, operationID string, previous CircuitSnapshot) (CircuitSnapshot, error) {
+	if operationID == "" {
+		return CircuitSnapshot{}, errors.New("isolation operation ID is required")
+	}
+	snapshot := circuit.Snapshot()
+	if snapshot.State != StateIsolating || snapshot.OperationID != operationID {
+		return snapshot, errors.New("circuit is no longer isolating under this operation")
+	}
+	return circuit.restore(previous), nil
+}
+
 func (s *IsolationService) Confirm(circuit *Circuit, stationID, circuitID, operationID string, matched bool, at time.Time) (CircuitSnapshot, error) {
 	snapshot := circuit.Snapshot()
 	if snapshot.StationID != stationID || snapshot.ID != circuitID || snapshot.OperationID != operationID {

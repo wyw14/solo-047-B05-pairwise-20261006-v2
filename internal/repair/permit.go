@@ -1,6 +1,7 @@
 package repair
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,6 +30,14 @@ type Permit struct {
 	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
+// ErrPermitPersist marks failures to durably record a permit. The in-memory
+// state is rolled back when it is returned, so callers may retry safely.
+var ErrPermitPersist = errors.New("permit persistence failed")
+
+// PermitPersister durably records a permit before it becomes visible in the
+// service. A nil persister rejects every state change.
+type PermitPersister func(permit Permit) error
+
 type PermitService struct {
 	mu        sync.RWMutex
 	permits   map[string]Permit
@@ -37,12 +46,13 @@ type PermitService struct {
 	receipts  *landing.ReceiptRegistry
 	ids       platform.IDGenerator
 	now       func() time.Time
+	persist   PermitPersister
 }
 
-func NewPermitService(isolation *feed.IsolationService, receipts *landing.ReceiptRegistry, ids platform.IDGenerator, now func() time.Time) *PermitService {
+func NewPermitService(isolation *feed.IsolationService, receipts *landing.ReceiptRegistry, ids platform.IDGenerator, now func() time.Time, persist PermitPersister) *PermitService {
 	return &PermitService{
 		permits: make(map[string]Permit), circuits: make(map[string]*feed.Circuit), isolation: isolation,
-		receipts: receipts, ids: ids, now: now,
+		receipts: receipts, ids: ids, now: now, persist: persist,
 	}
 }
 
@@ -57,6 +67,13 @@ func (s *PermitService) RegisterCircuit(circuit *feed.Circuit) {
 	s.circuits[circuitKey(snapshot.StationID, snapshot.ID)] = circuit
 }
 
+// Request creates an isolation permit for a circuit. The circuit transition
+// and the durable permit record form one atomic unit: the permit is persisted
+// before it becomes visible, and if persistence fails the circuit is rolled
+// back to its previous state and no permit is kept — a failure never leaves
+// an orphaned isolating circuit behind. Retrying is safe: a retry after a
+// failure starts clean, and a retry while a permit is still active for the
+// circuit returns that permit instead of conflicting.
 func (s *PermitService) Request(stationID, circuitID string) (Permit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -64,6 +81,10 @@ func (s *PermitService) Request(stationID, circuitID string) (Permit, error) {
 	if circuit == nil {
 		return Permit{}, fmt.Errorf("feed circuit %s/%s not found", stationID, circuitID)
 	}
+	if existing, active := s.activePermitLocked(stationID, circuitID); active {
+		return existing, nil
+	}
+	before := circuit.Snapshot()
 	permit := Permit{
 		ID: s.ids.New("permit"), StationID: stationID, CircuitID: circuitID,
 		OperationID: s.ids.New("isolation"), State: PermitRequested, UpdatedAt: s.now().UTC(),
@@ -72,8 +93,33 @@ func (s *PermitService) Request(stationID, circuitID string) (Permit, error) {
 		return Permit{}, err
 	}
 	permit.State = PermitIsolating
+	if err := s.persistPermit(permit); err != nil {
+		_, abortErr := s.isolation.Abort(circuit, permit.OperationID, before)
+		return Permit{}, errors.Join(err, abortErr)
+	}
 	s.permits[permit.ID] = permit
 	return permit, nil
+}
+
+// activePermitLocked returns the non-terminal permit covering a circuit, if
+// one exists. Callers must hold s.mu.
+func (s *PermitService) activePermitLocked(stationID, circuitID string) (Permit, bool) {
+	for _, permit := range s.permits {
+		if permit.StationID == stationID && permit.CircuitID == circuitID && permit.State != PermitReleased {
+			return permit, true
+		}
+	}
+	return Permit{}, false
+}
+
+func (s *PermitService) persistPermit(permit Permit) error {
+	if s.persist == nil {
+		return fmt.Errorf("%w: no persister configured", ErrPermitPersist)
+	}
+	if err := s.persist(permit); err != nil {
+		return fmt.Errorf("%w: %v", ErrPermitPersist, err)
+	}
+	return nil
 }
 
 func (s *PermitService) Evaluate(permitID string) (Permit, error) {

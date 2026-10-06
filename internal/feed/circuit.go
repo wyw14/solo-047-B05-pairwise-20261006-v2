@@ -52,3 +52,13 @@ func (c *Circuit) update(state State, operationID string, at time.Time) CircuitS
 	c.snapshot.UpdatedAt = at.UTC()
 	return c.snapshot
 }
+
+// restore puts the circuit back to a previously captured snapshot. It is the
+// compensation for a state transition whose follow-up failed, so the circuit
+// is left exactly as if the transition never happened.
+func (c *Circuit) restore(snapshot CircuitSnapshot) CircuitSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapshot = snapshot
+	return c.snapshot
+}
