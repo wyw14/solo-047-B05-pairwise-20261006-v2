@@ -52,3 +52,18 @@ func (c *Circuit) update(state State, operationID string, at time.Time) CircuitS
 	c.snapshot.UpdatedAt = at.UTC()
 	return c.snapshot
 }
+
+// Reset restores the circuit to the state it held before an in-progress
+// isolation. It only takes effect while the circuit is still owned by the
+// named, unfinished operation, so a reset can never clobber a state that
+// another operation already advanced.
+func (c *Circuit) Reset(restore State, operationID string, at time.Time) CircuitSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshot.State == StateIsolating && c.snapshot.OperationID == operationID {
+		c.snapshot.State = restore
+		c.snapshot.OperationID = ""
+		c.snapshot.UpdatedAt = at.UTC()
+	}
+	return c.snapshot
+}

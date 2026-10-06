@@ -10,6 +10,9 @@ type IsolationCommand struct {
 	CircuitID   string    `json:"circuit_id"`
 	OperationID string    `json:"operation_id"`
 	IssuedAt    time.Time `json:"issued_at"`
+	// Restore is the circuit state recorded before the isolation began. It is
+	// the state Abort must return the circuit to if the operation is abandoned.
+	Restore State `json:"restore"`
 }
 
 type IsolationService struct{}
@@ -26,10 +29,20 @@ func (s *IsolationService) Begin(circuit *Circuit, operationID string, at time.T
 	if snapshot.State != StateEnergized && snapshot.State != StateReleased {
 		return IsolationCommand{}, errors.New("circuit is not ready for isolation")
 	}
+	restore := snapshot.State
 	circuit.update(StateIsolating, operationID, at)
 	return IsolationCommand{
 		StationID: snapshot.StationID, CircuitID: snapshot.ID, OperationID: operationID, IssuedAt: at.UTC(),
+		Restore: restore,
 	}, nil
+}
+
+// Abort abandons an isolation that never produced a permit. It rolls the
+// circuit back to the state recorded by Begin unless the operation has already
+// advanced past isolating, in which case the current snapshot is returned
+// unchanged for the caller to reconcile.
+func (s *IsolationService) Abort(circuit *Circuit, command IsolationCommand, at time.Time) CircuitSnapshot {
+	return circuit.Reset(command.Restore, command.OperationID, at)
 }
 
 func (s *IsolationService) Confirm(circuit *Circuit, stationID, circuitID, operationID string, matched bool, at time.Time) (CircuitSnapshot, error) {

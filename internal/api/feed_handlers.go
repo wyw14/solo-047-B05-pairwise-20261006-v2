@@ -1,10 +1,12 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/wyw14/cry-103/internal/landing"
+	"github.com/wyw14/cry-103/internal/repair"
 )
 
 func (s *Server) startIsolation(writer http.ResponseWriter, request *http.Request) {
@@ -16,11 +18,20 @@ func (s *Server) startIsolation(writer http.ResponseWriter, request *http.Reques
 	}
 	permit, err := s.services.Permits.Request(stationID, input.CircuitID)
 	if err != nil {
+		// A permit already owns the circuit. Echo it so a retried request can
+		// adopt the existing permit instead of opening a rival isolation.
+		if errors.Is(err, repair.ErrPermitActive) {
+			writeJSON(writer, http.StatusConflict, permit)
+			return
+		}
+		// The permit failed to persist and the circuit was rolled back, so the
+		// client may safely retry from a clean state.
+		var persistErr *repair.PermitPersistError
+		if errors.As(err, &persistErr) {
+			writeError(writer, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeError(writer, http.StatusConflict, err)
-		return
-	}
-	if err := s.services.Persist("feed-isolation", permit.ID, permit); err != nil {
-		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(writer, http.StatusAccepted, permit)

@@ -43,7 +43,8 @@ func testServer(t *testing.T) *Server {
 	drainer := route.NewDrainer(0)
 	activator := route.NewActivator(registry)
 	receipts := landing.NewReceiptRegistry()
-	permitService := repair.NewPermitService(feed.NewIsolationService(), receipts, ids, clock.Now)
+	journal := store.NewJournal(filepath.Join(t.TempDir(), "events.jsonl"))
+	permitService := repair.NewPermitService(feed.NewIsolationService(), receipts, journal, ids, clock.Now)
 	circuit, err := feed.NewCircuit("B", "east", clock.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +61,7 @@ func testServer(t *testing.T) *Server {
 	acceptance := repair.NewAcceptanceService(switchover.NewRestorer(drainer, activator, registry, ids, clock.Now), clock.Now)
 	acceptance.Register("S3", target, path)
 	services := &Services{
-		Clock: clock, IDs: ids, Journal: store.NewJournal(filepath.Join(t.TempDir(), "events.jsonl")),
+		Clock: clock, IDs: ids, Journal: journal,
 		Spans: map[string]*span.Span{"S3": target}, Routes: map[string]*route.Route{"R-S3": path},
 		Repeaters: map[string]*repeater.Repeater{"R07": repeaterAsset}, Topology: registry,
 		OTDR:        otdr.NewSessionService(registry, landing.NewScanner(registry, 0), ids, clock.Now),
